@@ -1,4 +1,5 @@
 {
+    "cmake.showSystemKits": false,
     "cmake.options.statusBarVisibility": "hidden",
     "cmake.options.advanced": {
         "build": {
@@ -37,6 +38,7 @@
     "raspberry-pi-pico.cmakePath": "${HOME}/.pico-sdk/cmake/v3.31.5/bin/cmake",
     "raspberry-pi-pico.ninjaPath": "${HOME}/.pico-sdk/ninja/v1.12.1/ninja",
     "files.associations": {
+        "stdlib.h": "c",
         "ov7670_regs.h": "c"
     }
 }

@@ -7,6 +7,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Initialise pico_sdk from installed location
+# (note this can come from environment, CMake cache etc)
+
+# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
 if(WIN32)
     set(USERHOME $ENV{USERPROFILE})
 else()
@@ -19,53 +22,39 @@ set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
-
-# Set target board
+# ====================================================================================
 set(PICO_BOARD pico2 CACHE STRING "Board type")
 
-# Required TinyUSB configuration macros
-add_compile_definitions(
-    CFG_TUSB_MCU=OPT_MCU_RP2040
-    CFG_TUSB_OS=OPT_OS_PICO
-    CFG_TUSB_RHPORT0_MODE=OPT_MODE_DEVICE
-)
-
-# Pull in the Raspberry Pi Pico SDK
+# Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
-project(HW11_Project C CXX ASM)
+project(HW11 C CXX ASM)
 
-# Initialize the SDK
+# Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
-# Add your source files
-add_executable(HW11
-    HW11.c
-    usb_descriptors.c
-    core1.c  # optional, if still using
-)
+# Add executable. Default name is the project name, version 0.1
 
-# Optional: set program metadata
-pico_set_program_name(HW11 "HW11")
-pico_set_program_version(HW11 "0.1")
+cmake_minimum_required(VERSION 3.13)
 
-# Enable USB output, disable UART
-pico_enable_stdio_usb(HW11 1)
-pico_enable_stdio_uart(HW11 0)
+add_executable(HW11)
 
-# Link required libraries
-target_link_libraries(HW11
-    pico_stdlib
-    tinyusb_device
-    tinyusb_board
-    pico_multicore
-    hardware_adc  # if still used
-)
+target_sources(HW11 PUBLIC
+        ${CMAKE_CURRENT_LIST_DIR}/HW11.c
+        ${CMAKE_CURRENT_LIST_DIR}/usb_descriptors.c
+        )
 
-# Include current directory
-target_include_directories(HW11 PRIVATE
-    ${CMAKE_CURRENT_LIST_DIR}
-)
+# Make sure TinyUSB can find tusb_config.h
+target_include_directories(HW11 PUBLIC
+        ${CMAKE_CURRENT_LIST_DIR})
 
-# Generate UF2 file etc.
+# In addition to pico_stdlib required for common PicoSDK functionality, add dependency on tinyusb_device
+# for TinyUSB device support and tinyusb_board for the additional board support library used by the example
+target_link_libraries(HW11 PUBLIC pico_stdlib pico_unique_id tinyusb_device tinyusb_board)
+
+# Uncomment this line to enable fix for Errata RP2040-E5 (the fix requires use of GPIO 15)
+#target_compile_definitions(HW11 PUBLIC PICO_RP2040_USB_DEVICE_ENUMERATION_FIX=1)
+
 pico_add_extra_outputs(HW11)
+
+# add url via pico_set_program_url
