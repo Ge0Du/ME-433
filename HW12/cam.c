@@ -109,9 +109,9 @@ void init_camera_pins(){
     gpio_pull_up(I2C_SDA);
     gpio_pull_up(I2C_SCL);
     
-    printf("Start init camera\n");
+    //printf("Start init camera\n");
     init_camera();
-    printf("End init camera\n");
+    //printf("End init camera\n");
 
     // interrupts
     gpio_init(VS); // vertical sync
@@ -128,7 +128,7 @@ void init_camera_pins(){
     gpio_set_dir(PCLK, GPIO_IN);
     // read byte on rising PCLK
     gpio_set_irq_enabled_with_callback(PCLK, GPIO_IRQ_EDGE_RISE, true, &gpio_callback);
-    printf("end interrupts sync");
+    //printf("end interrupts sync");
 }
 
 // init the camera with RST and I2C commands

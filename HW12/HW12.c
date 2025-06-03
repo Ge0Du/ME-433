@@ -9,7 +9,7 @@ int main()
     while (!stdio_usb_connected()) {
         sleep_ms(100);
     }
-    printf("Hello, camera!\n");
+    //printf("Hello, camera!\n");
 
     init_camera_pins();
  

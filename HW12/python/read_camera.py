@@ -10,7 +10,7 @@ import time
 
 # ══ Configuration ══════════════════════════════════════════════════════
 # Replace this with your actual USB‐CDC port (e.g. "COM3" on Windows, "/dev/ttyACM0" on Linux).
-PORT = "/COM10"
+PORT = "/dev/ttyACM0"
 BAUD = 115200
 
 IMG_W = 80
