@@ -1,176 +1,121 @@
 /**
- * 3-Wheel Differential Drive with OV7670 Camera (D0–D7 on GPIO 17–24)
- * and NeoPixel Illumination on GPIO 16 (two LEDs), with NeoPixel driven on Core 1.
+ * 3-Wheel Differential Drive with OV7670 Camera (D0–D7 on GPIO 13,16,12,17,11,18,8,19)
+ * and NeoPixel Illumination on GPIO 27 (two LEDs), NeoPixel driven on Core 1.
  *
- * No USB-CDC dependency: this code does not wait for stdio.
+ * This version includes:
+ *   • USB‐CDC stdio initialization + wait‐for‐host at startup
+ *   • printf()‐based debug messages sprinkled throughout
+ *   • HSYNC/PCLK interrupts enabled only during frame capture to avoid spurious IRQ floods
+ *   • Centroid‐of‐white‐pixels steering with:
+ *       1) an adjustable “calibrated center” column (instead of fixed 40);
+ *       2) a deadzone defined as ±X% of image width around that center;
+ *       3) **discrete** MIN_SPEED/MAX_SPEED outside the deadzone (no quadratic).
  *
- * Files in this project:
- *   • CMakeLists.txt      ← CMake build file (unchanged from earlier)
- *   • HW17.c              ← this main application (motors, camera, Core 1 spawn)
- *   • ov7670_regs.h       ← extern declarations for OV7670_init[] & OV7670_rgb[]
+ * You can adjust:
+ *   • CALIBRATED_CENTER  — the column (0..79) you consider to be “perfectly centered.”
+ *   • DEADZONE_RATIO      — fraction of image width (0..1) defining ± deadzone around CALIBRATED_CENTER.
+ *   • MAX_SPEED           — PWM duty for the “fast” wheel when turning or driving straight (0..100).
+ *   • MIN_SPEED           — PWM duty for the “slow” wheel when turning (0..MAX_SPEED).
+ *
+ * Project files:
+ *   • CMakeLists.txt      ← must link pico_stdio_usb, pico_multicore, hardware_pwm, hardware_i2c, hardware_gpio
+ *   • HW18.c              ← this file (updated to use cam.c / cam.h)
+ *   • cam.h               ← camera‐pin macros + prototypes
+ *   • cam.c               ← camera ISR, init_camera(), convertImage(), etc.
+ *   • ov7670_regs.h       ← extern declarations for OV7670_init[][] & OV7670_rgb[][]
  *   • ov7670_regs.c       ← definitions of those arrays
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include "pico/stdlib.h"
+#include "pico/stdio_usb.h"       // for stdio_init_all(), stdio_usb_connected()
 #include "hardware/pwm.h"
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
 #include "pico/multicore.h"
-#include "ov7670_regs.h"   // ← extern declarations for OV7670_init[] & OV7670_rgb[]
+
+#include "cam.h"                   // camera‐pin defines, init_camera_pins(), setSaveImage(), getSaveImage(), convertImage(), etc.
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Add these two prototypes so the compiler knows about them before use:
+// Adjustable steering parameters:
 // ──────────────────────────────────────────────────────────────────────────────
-void    OV7670_write_register(uint8_t reg, uint8_t value);
-uint8_t OV7670_read_register(uint8_t reg);
 
-// --------------------------------
-// === CAMERA DEFINES & GLOBALS ===
-// --------------------------------
+// If your camera sees “perfect alignment” (e.g. full-white column) at x = 40, set this to 40.
+// Must be between 0 and IMAGESIZEX-1 (i.e., 0..79).
+#define CALIBRATED_CENTER  40
 
-// I²C for OV7670
-#define I2C_PORT    i2c1
-#define I2C_SDA     14
-#define I2C_SCL     15
+// Fraction of the full image width where robot drives straight.
+// e.g. 0.05 ⇒ ±2 pixels around CALIBRATED_CENTER (5% of 80 = 4 total).
+#define DEADZONE_RATIO     0.10f
 
-// Camera data pins on GP 17…24
-#define D0 13
-#define D1 16
-#define D2 12
-#define D3 17
-#define D4 11
-#define D5 18
-#define D6 8
-#define D7 19
+// PWM duty for the “fast” wheel when turning or driving straight (0..100).
+#define MAX_SPEED          60
 
-// VSYNC / HSYNC / MCLK / PCLK / RST
-#define VS   28     // VSYNC
-#define HS   9     // HSYNC
-#define MCLK 10    // 10 MHz clock via PWM
-#define PCLK 27   // Pixel clock
-#define RST  22    // Reset line (active LOW)
+// PWM duty for the “slow” wheel when turning (0..MAX_SPEED).
+// If you want sharper turns, make this smaller. Must be ≤ MAX_SPEED.
+#define MIN_SPEED           20
 
-#define IMAGESIZEX 80
-#define IMAGESIZEY 60
+#define LEFT_CALIBRATION   1.05f
 
-// Raw RGB565 buffer (2 bytes/pixel)
-static volatile uint8_t cameraData[IMAGESIZEX * IMAGESIZEY * 2];
+#define MIN_WHITE_RATIO     0.05f   // Example: 5% white pixels required to consider a valid line
 
-// Converted 8-bit R/G/B arrays
-typedef struct {
-    uint32_t index;
-    uint8_t r[IMAGESIZEX * IMAGESIZEY];
-    uint8_t g[IMAGESIZEX * IMAGESIZEY];
-    uint8_t b[IMAGESIZEX * IMAGESIZEY];
-} cameraImage_t;
-static volatile cameraImage_t picture;
-
-// IRQ-flags & counters
-static volatile uint8_t  saveImage     = 0;    // 1 = capture requested
-static volatile uint8_t  startImage    = 0;    // 1 = VSYNC seen
-static volatile uint8_t  startCollect  = 0;    // 1 = HSYNC seen on valid row
-static volatile uint32_t rawIndex      = 0;    // byte offset into cameraData
-static volatile uint32_t hsCount       = 0;    // row count
-static volatile uint32_t vsCount       = 0;    // pixel-clock ticks in a row
-
-// Prototypes
-void init_camera_pins();
-void init_camera();
-void setSaveImage(uint32_t s)       { saveImage = (uint8_t)s; }
-uint32_t getSaveImage()             { return (uint32_t)saveImage; }
-void convertImage();
-
-// GPIO interrupt callback for VS, HS, PCLK
-void gpio_callback(uint gpio, uint32_t events) {
-    if (gpio == VS) {
-        // VSYNC falling → start of a new frame
-        if (saveImage) {
-            rawIndex     = 0;
-            hsCount      = 0;
-            vsCount      = 0;
-            startImage   = 1;
-            startCollect = 0;
+// ──────────────────────────────────────────────────────────────────────────────
+// Send a crude 80×60 ASCII map over USB-CDC:
+//   “#” = pixel ≥ threshold; “.” = pixel < threshold.
+// You’ll see 60 lines of 80 characters each in your serial monitor.
+// ──────────────────────────────────────────────────────────────────────────────
+static void dumpThresholdedASCII(int threshold) {
+    for (int y = 0; y < IMAGESIZEY; y++) {
+        for (int x = 0; x < IMAGESIZEX; x++) {
+            int idx = y * IMAGESIZEX + x;
+            bool is_white = (
+                picture.r[idx] >= threshold &&
+                picture.g[idx] >= threshold &&
+                picture.b[idx] >= threshold
+            );
+            putchar(is_white ? '#' : '.');
         }
+        putchar('\n');
     }
-    else if (gpio == HS) {
-        // HSYNC rising → start of a new row
-        if (saveImage && startImage) {
-            startCollect = 1;
-            hsCount++;
-            if (hsCount == IMAGESIZEY) {
-                // Collected all rows → stop
-                saveImage     = 0;
-                startImage    = 0;
-                startCollect  = 0;
-                hsCount       = 0;
-            }
-        }
-    }
-    else if (gpio == PCLK) {
-        // PCLK rising → sample one byte from D0..D7
-        if (saveImage && startImage && startCollect) {
-            vsCount++;
-            uint8_t bit0 = gpio_get(D0);
-            uint8_t bit1 = gpio_get(D1);
-            uint8_t bit2 = gpio_get(D2);
-            uint8_t bit3 = gpio_get(D3);
-            uint8_t bit4 = gpio_get(D4);
-            uint8_t bit5 = gpio_get(D5);
-            uint8_t bit6 = gpio_get(D6);
-            uint8_t bit7 = gpio_get(D7);
-            uint8_t pixel_byte = (bit7 << 7) | (bit6 << 6) | (bit5 << 5) | (bit4 << 4)
-                               | (bit3 << 3) | (bit2 << 2) | (bit1 << 1) |  bit0;
-            cameraData[rawIndex++] = pixel_byte;
-
-            // If buffer full, stop capturing
-            if (rawIndex >= IMAGESIZEX * IMAGESIZEY * 2) {
-                saveImage     = 0;
-                startImage    = 0;
-                startCollect  = 0;
-            }
-            // End of a row (2 bytes × IMAGESIZEX)
-            if (vsCount == IMAGESIZEX * 2) {
-                startCollect = 0;
-                vsCount      = 0;
-            }
-        }
-    }
+    putchar('\n');
+    fflush(stdout);
 }
 
 // ----------------------------------
 // === MOTOR & BUTTON DEFINES / CODE ===
 // ----------------------------------
 
-// Left motor (flipped wiring, DRV8833)
-#define LEFT_IN1_PIN   0   // PWM slice 0, channel A
-#define LEFT_IN2_PIN   1   // PWM slice 0, channel B
+// Left motor (wiring is flipped on DRV8833)
+#define LEFT_IN1_PIN   0    // PWM slice 0, channel A
+#define LEFT_IN2_PIN   1    // PWM slice 0, channel B
 
-// Right motor (normal wiring, DRV8833)
-#define RIGHT_IN1_PIN  2   // PWM slice 1, channel A
-#define RIGHT_IN2_PIN  3   // PWM slice 1, channel B
+// Right motor (normal DRV8833 wiring)
+#define RIGHT_IN1_PIN  2    // PWM slice 1, channel A
+#define RIGHT_IN2_PIN  4    // PWM slice 1, channel B
 
-// Button on GP 26 (active-LOW, pull-up)
-#define BUTTON_PIN     26
+// Button on GP20 (active-LOW input with pull-up)
+#define BUTTON_PIN     20
 
-static const uint16_t LEFT_WRAP  = 65535;  // ~1.9 kHz
-static const uint16_t RIGHT_WRAP = 65535;  // ~1.9 kHz
+static const uint16_t LEFT_WRAP  = 65535;   // ~1.9 kHz
+static const uint16_t RIGHT_WRAP = 65535;   // ~1.9 kHz
 #define DUTY_MIN   0
 #define DUTY_MAX 100
 
 // Drive left motor “forward physically” (swap channels because wiring is flipped)
 static void set_left_motor(int duty) {
+    float scaled = (float)duty * LEFT_CALIBRATION;
+    int adjusted = (int)scaled;
     uint slice = pwm_gpio_to_slice_num(LEFT_IN1_PIN);
-    if (duty < DUTY_MIN) duty = DUTY_MIN;
-    if (duty > DUTY_MAX) duty = DUTY_MAX;
-    uint16_t level = (uint16_t)(((uint32_t)LEFT_WRAP * (uint32_t)duty) / 100);
+    if (adjusted < DUTY_MIN) adjusted = DUTY_MIN;
+    if (adjusted > DUTY_MAX) adjusted = DUTY_MAX;
+    uint16_t level = (uint16_t)(((uint32_t)LEFT_WRAP * (uint32_t)adjusted) / 100);
 
-    if (duty > 0) {
-        // Flipped: IN1 = 0, IN2 = PWM
-        pwm_set_chan_level(slice, PWM_CHAN_A, 0);      // LEFT_IN1_PIN
-        pwm_set_chan_level(slice, PWM_CHAN_B, level);  // LEFT_IN2_PIN
+    if (adjusted > 0) {
+        // Flipped hardware: IN1 = PWM, IN2 = 0  
+        pwm_set_chan_level(slice, PWM_CHAN_A, level);  // LEFT_IN1_PIN
+        pwm_set_chan_level(slice, PWM_CHAN_B, 0);      // LEFT_IN2_PIN
     } else {
-        // Stop/coast
         pwm_set_chan_level(slice, PWM_CHAN_A, 0);
         pwm_set_chan_level(slice, PWM_CHAN_B, 0);
     }
@@ -196,74 +141,83 @@ static void set_right_motor(int duty) {
 // === WS2812B (NeoPixel) ON CORE 1 ===
 // ----------------------------------
 
-// NeoPixel data on GP 16 (two chained LEDs)
-#define NEOPIXEL_PIN 16
+// NeoPixel data pin on GP27 (two chained WS2812B LEDs)
+#define NEOPIXEL_PIN 5
 
-// Timing constants (125 MHz clock ≈ 8 ns/cycle)
-static const int T0H = 50;   // ~400 ns
-static const int T0L = 106;  // ~850 ns
-static const int T1H = 100;  // ~800 ns
-static const int T1L = 56;   // ~450 ns
+// Timing constants (125 MHz clock ≈ 8 ns per cycle)
+static const int T0H = 50;   // ~400 ns high for “0”
+static const int T0L = 106;  // ~850 ns low  for “0”
+static const int T1H = 100;  // ~800 ns high for “1”
+static const int T1L = 56;   // ~450 ns low  for “1”
 
-// Send one 24-bit GRB pixel to WS2812 (no interrupts disabled here).
+// Send one 24-bit GRB pixel to the WS2812 chain. No interrupt disable.
 static void put_pixel(uint32_t grb) {
     for (int8_t i = 23; i >= 0; i--) {
         if (grb & (1u << i)) {
-            // '1' bit: ~800 ns HIGH, ~450 ns LOW
+            // ‘1’ bit: ~800 ns HIGH, ~450 ns LOW
             gpio_put(NEOPIXEL_PIN, 1);
             for (int j = 0; j < T1H; j++) __asm__ volatile("nop");
             gpio_put(NEOPIXEL_PIN, 0);
             for (int j = 0; j < T1L; j++) __asm__ volatile("nop");
         } else {
-            // '0' bit: ~400 ns HIGH, ~850 ns LOW
+            // ‘0’ bit: ~400 ns HIGH, ~850 ns LOW
             gpio_put(NEOPIXEL_PIN, 1);
             for (int j = 0; j < T0H; j++) __asm__ volatile("nop");
             gpio_put(NEOPIXEL_PIN, 0);
             for (int j = 0; j < T0L; j++) __asm__ volatile("nop");
         }
     }
-    // Latch: hold low for >50 μs
+    // Latch: hold low >50 µs
     gpio_put(NEOPIXEL_PIN, 0);
     sleep_us(60);
 }
 
-// Light two chained WS2812 LEDs solid white
+// Light both chained WS2812 LEDs solid white
 static void set_two_pixels_white() {
-    // GRB = {G=255, R=255, B=255} → 0xFF_FF_FF
-    uint32_t white = (255u << 16) | (255u << 8) | 255u;
+    uint32_t white = (255u << 16) | (255u << 8) | 255u;  // GRB = {G=255, R=255, B=255}
     put_pixel(white);
     put_pixel(white);
 }
 
-// This function will run on CORE 1
+// Entry point for Core 1 (drives NeoPixel)
 void core1_entry() {
-    // 1) Initialize GP16 as NeoPixel data pin
+    // 1) Initialize GP27 for NeoPixel
     gpio_init(NEOPIXEL_PIN);
     gpio_set_dir(NEOPIXEL_PIN, GPIO_OUT);
 
-    // 2) Immediately light both LEDs white
+    // 2) Immediately light two LEDs white
     set_two_pixels_white();
 
-    // 3) Now just idle, or you could wait on FIFO for future color changes.
+    // 3) Idle in a tight loop thereafter
     while (1) {
         tight_loop_contents();
     }
 }
 
 // ----------------------------------
-// === MAIN (runs on CORE 0) ===
+// === MAIN (runs on CORE 0)        ===
 // ----------------------------------
 
 int main() {
-    // 1) Launch Core 1 for NeoPixel
-    multicore_launch_core1(core1_entry);
+    // ——————————————————————————————————————————————————————————
+    // 0) USB-CDC stdio init + wait for host
+    // ——————————————————————————————————————————————————————————
+    stdio_init_all();
+    printf("\n--- HW18: waiting for USB stdio connection ---\n");
 
-    // 2) Button = GP26, input + pull-up
+    printf("USB stdio connected; starting application.\n");
+
+    // 1) Launch Core 1 so it drives the NeoPixel independently
+    multicore_launch_core1(core1_entry);
+    printf("Launched Core 1 for NeoPixel.\n");
+
+    // 2) Configure button on GP20 (input + pull-up)
     gpio_init(BUTTON_PIN);
     gpio_set_dir(BUTTON_PIN, GPIO_IN);
     gpio_pull_up(BUTTON_PIN);
 
     // 3) Motor PWM initialization
+    printf("Configuring motor PWM slices...\n");
     //    Left motor (flipped) on PWM slice 0
     gpio_set_function(LEFT_IN1_PIN, GPIO_FUNC_PWM);
     gpio_set_function(LEFT_IN2_PIN, GPIO_FUNC_PWM);
@@ -280,22 +234,33 @@ int main() {
         pwm_set_wrap(slice, RIGHT_WRAP);
         pwm_set_enabled(slice, true);
     }
+    printf("Motors configured.\n");
 
-    // 4) Initialize camera pins + OV7670
+    // 4) Initialize camera pins + OV7670 (but only VSYNC IRQ now)
+    printf("Initializing camera pins and OV7670 registers...\n");
     init_camera_pins();
+    for (int i = 0; i < 100; i++) {
+        printf("•• VSYNC reads: %d\n", gpio_get(VS));
+        sleep_ms(50);
+    }
+    printf("•• Done polling VSYNC.\n");
+    printf("Camera initialization complete.\n");
 
     // 5) Main loop: toggle “running” via button, perform line-follow when running
     bool running = false;
+    printf("Entering main loop; press button to start/stop.\n");
     while (true) {
-        // Button pressed? (active-LOW)
+        // If button pressed (active-LOW):
         if (gpio_get(BUTTON_PIN) == 0) {
             sleep_ms(20);  // debounce
             if (gpio_get(BUTTON_PIN) == 0) {
                 running = !running;
+                printf("Button pressed → running = %s\n", running ? "true" : "false");
                 if (!running) {
                     // Stop motors when leaving line-follow mode
                     set_left_motor(0);
                     set_right_motor(0);
+                    printf("Motors stopped.\n");
                 }
                 // Wait until button released
                 while (gpio_get(BUTTON_PIN) == 0) {
@@ -315,144 +280,115 @@ int main() {
             // 7) Convert raw RGB565 → 8-bit R/G/B
             convertImage();
 
-            // 8) Analyze “non-white” pixel counts on left vs. right half
-            const int white_threshold = 16;
-            int left_nonwhite  = 0;
-            int right_nonwhite = 0;
+            // 8) === centroid‐based steering with custom center, no quadratic ===
+            const int white_threshold = 200;
+            dumpThresholdedASCII(white_threshold);
+            uint32_t sum_x = 0;
+            int white_count = 0;
             for (uint32_t idx = 0; idx < IMAGESIZEX * IMAGESIZEY; idx++) {
                 bool is_white = (picture.r[idx] >= white_threshold &&
                                  picture.g[idx] >= white_threshold &&
                                  picture.b[idx] >= white_threshold);
-                if (!is_white) {
+                if (is_white) {
                     uint32_t x = idx % IMAGESIZEX;
-                    if (x < (IMAGESIZEX / 2)) left_nonwhite++;
-                    else                    right_nonwhite++;
+                    sum_x += x;
+                    white_count++;
                 }
             }
-
-            // 9) Steering logic
-            int base_speed = 100;
-            int turn_speed = 80;  // slow side to 80% duty for turning
-            if (left_nonwhite > right_nonwhite + 20) {
-                // Left side “off-line” → turn right
-                set_left_motor(turn_speed);
-                set_right_motor(base_speed);
-            } else if (right_nonwhite > left_nonwhite + 20) {
-                // Right side “off-line” → turn left
-                set_left_motor(base_speed);
-                set_right_motor(turn_speed);
-            } else {
-                // Both sides mostly white → drive straight
-                set_left_motor(base_speed);
-                set_right_motor(base_speed);
+            float white_ratio = (float)white_count / (IMAGESIZEX * IMAGESIZEY);
+            printf("White pixel ratio: %.3f (threshold: %.3f)\n", white_ratio, MIN_WHITE_RATIO);
+            int last_direction = 0;
+            // If too few white pixels, ignore centroid and continue to flip/sweep logic
+            if (white_ratio < MIN_WHITE_RATIO) {
+                // Not enough white pixels → treat like no line
+                if (last_direction < 0) {
+                    // Last turn was left → now sweep RIGHT
+                    set_left_motor(MAX_SPEED);
+                    set_right_motor(MIN_SPEED);
+                    printf("Too few white pixels → SWEEP RIGHT (L=%d, R=%d)\n", MAX_SPEED, MIN_SPEED);
+                    last_direction = +1;
+                } else if (last_direction > 0) {
+                    // Last turn was right → now sweep LEFT
+                    set_left_motor(MIN_SPEED);
+                    set_right_motor(MAX_SPEED);
+                    printf("Too few white pixels → SWEEP LEFT (L=%d, R=%d)\n", MIN_SPEED, MAX_SPEED);
+                    last_direction = -1;
+                } else {
+                    // Never saw a line → stop
+                    set_left_motor(0);
+                    set_right_motor(0);
+                    printf("Too few white pixels & no last_direction → STOP\n");
+                }
+                // Skip the centroid-based steering altogether
+                sleep_ms(100);
+                continue;
             }
+            if (white_count > 0) {
+                float centroid_x = (float)sum_x / (float)white_count; // [0..79]
 
-            // ~10 FPS
+                // Compute deadzone boundaries based on CALIBRATED_CENTER and DEADZONE_RATIO
+                float half_dead = (IMAGESIZEX * DEADZONE_RATIO) / 2.0f; // e.g. 80*0.05/2 = 2.0
+                float center = (float)CALIBRATED_CENTER;               // 40.0
+                float center_min = center - half_dead;                 // 40 - 2 = 38
+                float center_max = center + half_dead;                 // 40 + 2 = 42
+
+                if (centroid_x >= center_min && centroid_x <= center_max) {
+                    // within deadzone → go straight
+                    set_left_motor(MAX_SPEED);
+                    set_right_motor(MAX_SPEED);
+                    printf(
+                      "Centroid %.2f in deadzone [%.2f..%.2f] → STRAIGHT (L=%d, R=%d)\n",
+                      centroid_x, center_min, center_max,
+                      MAX_SPEED, MAX_SPEED
+                    );
+                    last_direction = 0;
+                } else if (centroid_x < center_min) {
+                    // line is left of calibrated center → turn LEFT
+                    set_left_motor(MAX_SPEED);
+                    set_right_motor(MIN_SPEED);
+                    printf(
+                      "Centroid %.2f < %.2f → TURN LEFT (L=%d, R=%d)\n",
+                      centroid_x, center_min, MIN_SPEED, MAX_SPEED
+                    );
+                    last_direction = -1;
+                } else {
+                    // centroid_x > center_max → turn RIGHT
+                    set_left_motor(MIN_SPEED);
+                    set_right_motor(MAX_SPEED);
+                    printf(
+                      "Centroid %.2f > %.2f → TURN RIGHT (L=%d, R=%d)\n",
+                      centroid_x, center_max, MAX_SPEED, MIN_SPEED
+                    );
+                    last_direction = +1;
+                }
+            } else {
+                // No white pixels → flip from the last non‐straight turn:
+                if (last_direction < 0) {
+                    // Last turn was left → now sweep RIGHT
+                    set_left_motor(MAX_SPEED);
+                    set_right_motor(MIN_SPEED);
+                    printf("No line → FLIP → SWEEP RIGHT (L=%d, R=%d)\n", MAX_SPEED, MIN_SPEED);
+                    last_direction = +1;
+                } else if (last_direction > 0) {
+                    // Last turn was right → now sweep LEFT
+                    set_left_motor(MIN_SPEED);
+                    set_right_motor(MAX_SPEED);
+                    printf("No line → FLIP → SWEEP LEFT (L=%d, R=%d)\n", MIN_SPEED, MAX_SPEED);
+                    last_direction = -1;
+                } else {
+                    // last_direction = 0 (never saw a line) → stop
+                    set_left_motor(0);
+                    set_right_motor(0);
+                    printf("No line & no last_direction → STOP (L=0, R=0)\n");
+                }
+            }
+            // throttle to ~10 FPS
             sleep_ms(100);
         } else {
+            // not running → tiny sleep
             sleep_ms(10);
         }
     }
+    // (unreachable)
     return 0;
-}
-
-// -----------------------------
-// Camera Pin + OV7670 Setup
-// -----------------------------
-
-void init_camera_pins() {
-    // 1) Data pins D0..D7 = GP 17..24, all inputs
-    for (int pin = D0; pin <= D7; pin++) {
-        gpio_init(pin);
-        gpio_set_dir(pin, GPIO_IN);
-    }
-
-    // 2) RST = GP 12 as output; hold HIGH after reset
-    gpio_init(RST);
-    gpio_set_dir(RST, GPIO_OUT);
-    gpio_put(RST, 1);
-
-    // 3) MCLK = GP 10 → ~10 MHz PWM 
-    gpio_set_function(MCLK, GPIO_FUNC_PWM);
-    {
-        uint slice = pwm_gpio_to_slice_num(MCLK);
-        pwm_set_clkdiv(slice, 2.0f);   // divide by 2 → 62.5 MHz
-        pwm_set_wrap(slice, 3);        // counter 0..3 → 4 steps → 15.625 MHz
-        pwm_set_enabled(slice, true);
-        pwm_set_chan_level(slice, PWM_CHAN_A, 2);  // 50% duty (2/4)
-    }
-
-    sleep_ms(50);
-
-    // 4) Initialize I²C1 @100 kHz on GP 14/15
-    i2c_init(I2C_PORT, 100 * 1000);
-    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA);
-    gpio_pull_up(I2C_SCL);
-
-    // 5) Software + hardware reset + register writes
-    init_camera();
-
-    // 6) VSYNC = GP 8 (input, falling-edge triggers new frame)
-    gpio_init(VS);
-    gpio_set_dir(VS, GPIO_IN);
-    gpio_set_irq_enabled_with_callback(VS, GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
-
-    // 7) HSYNC = GP 9 (input, rising-edge triggers new row)
-    gpio_init(HS);
-    gpio_set_dir(HS, GPIO_IN);
-    gpio_set_irq_enabled(HS, GPIO_IRQ_EDGE_RISE, true);
-
-    // 8) PCLK = GP 11 (input, rising-edge samples data)
-    gpio_init(PCLK);
-    gpio_set_dir(PCLK, GPIO_IN);
-    gpio_set_irq_enabled(PCLK, GPIO_IRQ_EDGE_RISE, true);
-}
-
-void init_camera() {
-    // Hardware reset: pulse RST low
-    gpio_put(RST, 0);
-    sleep_ms(1);
-    gpio_put(RST, 1);
-    sleep_ms(50);
-
-    // Software reset (COM7 = 0x80)
-    OV7670_write_register(0x12, 0x80);
-    sleep_ms(50);
-
-    // PLL / clock config for 30 FPS
-    OV7670_write_register(0x11, 1);  // CLKRC = 1 (divide by 1)
-    OV7670_write_register(0x6B, 0);  // DBLV   = 0 (no PLL)
-
-    // RGB565 format (COM7, RGB444, COM15)
-    for (int i = 0; i < 3; i++) {
-        OV7670_write_register(OV7670_rgb[i][0], OV7670_rgb[i][1]);
-    }
-
-    // Write all 93 registers from OV7670_init[][]
-    for (int i = 0; i < 93; i++) {
-        OV7670_write_register(OV7670_init[i][0], OV7670_init[i][1]);
-    }
-}
-
-// I²C write to OV7670
-void OV7670_write_register(uint8_t reg, uint8_t value) {
-    uint8_t buf[2] = {reg, value};
-    i2c_write_blocking(I2C_PORT, 0x21, buf, 2, false);
-    sleep_ms(1);
-}
-
-// Convert raw RGB565 → 8-bit R/G/B arrays
-void convertImage() {
-    picture.index = 0;
-    for (int i = 0; i < IMAGESIZEX * IMAGESIZEY * 2; i += 2) {
-        uint8_t hi = cameraData[i];
-        uint8_t lo = cameraData[i + 1];
-        // hi = RRRRRGGG, lo = GGGBBBBB
-        picture.r[picture.index] = hi >> 3;                                // 5 bits → 0..31
-        picture.g[picture.index] = ((hi & 0x07) << 3) | ((lo & 0xE0) >> 5); // 6 bits → 0..63
-        picture.b[picture.index] = lo & 0x1F;                               // 5 bits → 0..31
-        picture.index++;
-    }
 }

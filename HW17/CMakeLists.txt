@@ -31,7 +31,7 @@ pico_sdk_init()
 # Create an executable named “HW17” from HW17.c and ov7670_regs.c
 add_executable(HW17
     HW17.c
-    ov7670_regs.c
+    cam.c
 )
 
 # (Optional) Human-readable program name and version
@@ -56,6 +56,7 @@ target_link_libraries(HW17
     hardware_pwm
     hardware_i2c
     hardware_gpio
+    pico_stdio_usb
     pico_multicore
 )
 
