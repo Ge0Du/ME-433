@@ -1,10 +1,6 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
-
-// I2C defines
-// This example will use I2C0 on GPI14 (SDA) and GPI15 (SCL) running at 400KHz.
-// Pins can be changed, see the GPIO function select table in the datasheet for information on GPIO assignments
 #define I2C_PORT i2c0
 #define I2C_SDA 12
 #define I2C_SCL 13
@@ -46,23 +42,19 @@ int main()
     }
     printf("Start!\r\n");
 
-    // Initialise Heartbeat
     gpio_init(HEARTBEAT_LED);
     gpio_set_dir(HEARTBEAT_LED, GPIO_OUT);
 
     printf("Heartbeat Initialised\r\n");
 
-    // I2C Initialisation. Using it at 400Khz.
     i2c_init(I2C_PORT, 400*1000);
     
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA);
     gpio_pull_up(I2C_SCL);
-    // For more examples of I2C use see https://github.com/raspberrypi/pico-examples/tree/master/i2c
     printf("Pins Initialised\r\n");
 
-    // Initialise Pins on MCP
    setPin(ADDR, 0x00, 0b00000001);
    setPin(ADDR, 0x0A, 0x00);  // Ensure GP7 is off initially
    printf("MCP Initialised");

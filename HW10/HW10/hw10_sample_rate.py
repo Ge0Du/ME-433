@@ -3,10 +3,6 @@
 from hw10_read_csv import load_csv_to_arrays
 
 def compute_sample_rate(times):
-    """
-    Given a NumPy array of time stamps (strictly increasing),
-    return the sample rate in Hz: N / (t_last - t_first).
-    """
     N = len(times)
     t_total = times[-1] - times[0]
     if t_total <= 0:

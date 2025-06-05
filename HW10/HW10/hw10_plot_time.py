@@ -4,9 +4,6 @@ import matplotlib.pyplot as plt
 from hw10_read_csv import load_csv_to_arrays
 
 def plot_time_domain(filename, ax):
-    """
-    Loads 'filename' (CSV) into arrays, then plots time vs. value on ax.
-    """
     t, x = load_csv_to_arrays(filename)
     ax.plot(t, x, color='black', linewidth=1)
     ax.set_xlabel('Time (s)')

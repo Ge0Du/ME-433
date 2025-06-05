@@ -7,15 +7,6 @@ from hw10_sample_rate import compute_sample_rate
 import os
 
 def design_lowpass_fir(N, fc, sr, window='hamming'):
-    """
-    Designs an N‐tap low‐pass FIR with cutoff fc (Hz) at sample rate sr (Hz).
-    Returns the filter kernel h (length N).
-    Steps:
-      1. n = 0...N-1, M = (N-1)/2
-      2. Ideal sinc: h0[n] = (2 * fc/sr) * sinc( (n - M)*(fc/sr) )
-      3. Multiply by window w[n]
-      4. Normalize so sum(h) = 1 (unity DC gain)
-    """
     n = np.arange(N)
     M = (N - 1) / 2.0
     fc_over_sr = fc / sr
@@ -39,16 +30,9 @@ def design_lowpass_fir(N, fc, sr, window='hamming'):
     return h
 
 def apply_fir(x, h):
-    """
-    Convolves x with filter h using 'same' so output y has same length as x.
-    """
     return np.convolve(x, h, mode='same')
 
 def compute_one_sided_fft(y, sr):
-    """
-    Given a real-valued signal y and sample rate sr, subtract mean, then
-    compute one-sided FFT, returning (freqs, mags) with proper scaling.
-    """
     y0 = y - np.mean(y)
     N = len(y0)
     R = np.fft.rfft(y0)
